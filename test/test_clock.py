@@ -68,6 +68,14 @@ class TestClock(unittest.TestCase):
             pll.create_clkout(ClockDomain("clkout{}".format(i)), 200e6)
         pll.compute_config()
 
+    # Lattice / CrosslinkNX
+    def test_crosslinknxpll(self):
+        pll = CrossLinkNXPLL()
+        pll.register_clkin(Signal(), 100e6)
+        for i in range(pll.nclkouts_max):
+            pll.create_clkout(ClockDomain("clkout{}".format(i)), 200e6)
+        pll.compute_config()
+
     # Altera / CycloneIV
     def test_cycloneivpll(self):
         pll = CycloneIVPLL()

@@ -6,6 +6,7 @@
 
 import math
 import logging
+from collections import namedtuple
 
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
@@ -752,6 +753,135 @@ class ECP5PLL(Module):
         self.specials += Instance("EHXPLLL", **self.params)
 
 # Lattice / CrossLink-NX -----------------------------------------------------------------------------------
+class FreqRange(namedtuple("FreqRange", ["min", "max"])):
+    def __contains__(self, freq):
+        return self.min <= freq <= self.max
+
+class PLLClockOut(namedtuple("PLLClockOut", ["clksig", "freq", "phase", "margin"])):
+    def within_margin(self, candidate):
+        return self.margin >= abs(candidate - self.freq)/self.freq
+
+class CrossLinkNXPLL(Module):
+    nclkouts_max    = 5
+    clki_div_range  = range(1, 128+1)
+    clko_div_range  = range(2, 128+1)
+    phase_max       = 128
+
+    clki_freq_range = FreqRange(  10e6,  500e6)
+    clko_freq_range = FreqRange(6.25e6,  800e6)
+    vco_freq_range  = FreqRange( 800e6, 1600e6)
+
+    PARAMS_BASE = {
+        # Required params
+	"p_FBK_INTEGER_MODE": "ENABLED",
+	"p_FBK_MASK": "0b00000000",
+	"p_FBK_MMD_DIG": "1", # FB divider always 1. Uses OS5 divider instead.
+	"p_REF_INTEGER_MODE": "ENABLED",
+	"p_REF_MASK": "0b00000000",
+	"p_EXTERNAL_DIVIDE_FACTOR": "1",
+        "p_SC_EN_SDM": "DISABLED",
+	"p_SSC_EN_SSC": "DISABLED",
+	"p_PLLPDN_EN": "DISABLED",
+	"p_PLLPD_N": "USED",
+	"p_PLLRESET_ENA": "ENABLED",
+	"p_SEL_FBK": "DIVF", # Use CLKOS5 for feedback
+	"p_CLKMUX_FB": "CMUX_CLKOS5",
+	# Magical analog config
+        "p_V2I_PP_ICTRL": "0b11111",
+	"p_KP_VCO": "0b00011",
+	"p_CSET": "64P",
+	"p_CRIPPLE": "1P",
+	"p_IPP_CTRL": "0b1011",
+	"p_IPP_SEL": "0b0001",
+	"p_BW_CTL_BIAS": "0b0101",
+	"p_IPI_CMPN": "0b0011",
+	"p_IPI_CMP": "0b0001",
+	"p_V2I_PP_RES": "9P3K",
+	"p_V2I_KVCO_SEL": "60",
+	"p_V2I_1V_EN": "ENABLED",
+        # Required inputs/outputs
+        "i_PLLPOWERDOWN_N": 0,
+        "i_STDBY": 0,
+        "i_LEGACY": 1,
+    }
+
+    class ClockConfig(namedtuple("ClockConfig", ["n", "div", "clock_out"])):
+        def add_to_params(self, params):
+            name = {0: "P", 1: "S", 2: "S2", 3: "S3", 4: "S4", 5: "S5"}[self.n]
+            letter = chr(ord('A') + self.n)
+            phase = int((1+clock_out.phase/360) * self.div)
+            if phase > phase_max:
+                phase -= self.div
+            params.update({
+                p_ENCLK_CLKO + name: "ENABLED",
+                p_DIV + letter: str(self.div - 1),
+                p_DEL + letter: str(phase - 1),
+            })
+            if self.clock_out.clksig:
+                params["o_CLKO" + name] = self.clock_out.clksig
+
+    def __init__(self):
+        self.logger = logging.getLogger("CrossLinkNXPLL")
+        self.logger.info("Creating CrossLinkNXPLL.")
+        self.reset      = Signal()
+        self.clkin      = Signal()
+        self.locked     = Signal()
+        self.clkin_freq = None
+        self.clkouts    = []
+
+    def register_clkin(self, clkin, freq):
+        if not isinstance(clkin, (Signal, ClockSignal)):
+            raise ValueError
+        self.comb += self.clkin.eq(clkin)
+        assert freq in self.clki_freq_range
+        self.clkin_freq = freq
+        register_clkin_log(self.logger, clkin, freq)
+
+    def create_clkout(self, cd, freq, phase=0, margin=1e-2):
+        assert freq in self.clko_freq_range
+        assert len(self.clkouts) < self.nclkouts_max
+        clkout = Signal()
+        self.clkouts.append(PLLClockOut(clkout, freq, phase, margin))
+        self.comb += cd.clk.eq(clkout)
+        create_clkout_log(self.logger, cd.name, freq, margin, len(self.clkouts))
+
+    def find_clock_config(self, n, vco_freq, clk_out):
+        for candidate_div in self.clko_div_range:
+            candidate_freq = vco_freq/candidate_div
+            if clk_out.within_margin(candidate_freq):
+                return CrossLinkNXPLL.ClockConfig(n, candidate_div, clk_out)
+        return None
+
+    def compute_config(self):
+        for clki_div in self.clki_div_range:
+            for fb_div in self.clko_div_range:
+                vco_freq = self.clkin_freq/clki_div*fb_div
+                if vco_freq in self.vco_freq_range:
+                    clk_configs = [self.find_clock_config(n, vco_freq, clk_out)
+                            for n, clk_out in enumerate(self.clkouts)]
+                    if all(config is not None for config in clk_configs):
+                        return clki_div, fb_div, clk_configs
+        raise ValueError("No PLL config found")
+
+    def do_finalize(self):
+        clki_div, fb_div, clk_configs = self.compute_config()
+        clkfb  = Signal()
+        params = PARAMS_BASE.copy()
+        internal_feedback = Signal()
+        params.update(
+            i_PLLRESET  = self.reset,
+            i_REFCK     = self.clkin,
+            p_REF_MMD_DIG = str(clki_div),
+            o_LOCK      = self.locked,
+            o_INTFBKOS5 = internal_feedback,
+            i_FBKCK     = internal_feedback,
+            )
+        CrossLinkNXPLL.ClockConfig(5, fb_div, None).add_params(params)
+        for clk_config in clk_configs:
+            clk_config.add_params(params)
+        self.specials += Instance("PLL", **self.params)
+
+
 # TODO LF Clock, I2C Clck, Lots of undocumented ports on the OSC primitive
 # NOTE This clock has +/- 15% accuracy
 class CrossLinkNXOSCA(Module):
